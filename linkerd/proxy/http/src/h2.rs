@@ -1,10 +1,14 @@
 use crate::{Body, TokioExecutor};
 use futures::prelude::*;
-use linkerd_error::{Error, Result};
+use linkerd_error::{cause_ref, Error, Result};
 use linkerd_stack::{MakeConnection, Service};
 use std::{
     marker::PhantomData,
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 use tracing::instrument::Instrument;
@@ -23,6 +27,29 @@ pub struct Connect<C, B> {
 #[derive(Debug)]
 pub struct Connection<B> {
     tx: hyper::client::conn::http2::SendRequest<B>,
+    /// Set by the connection task when the peer's GOAWAY shuts the
+    /// connection down.
+    peer_goaway: Arc<AtomicBool>,
+}
+
+/// The error produced for a request that hyper canceled--i.e., abandoned
+/// before it could be written to a connection--because the peer's GOAWAY shut
+/// the connection down.
+#[derive(Debug, thiserror::Error)]
+#[error("request canceled by the peer's GOAWAY: {source}")]
+pub struct GoAwayCanceled {
+    #[source]
+    source: hyper::Error,
+}
+
+// === impl GoAwayCanceled ===
+
+impl GoAwayCanceled {
+    /// Public so that tests in other crates can synthesize this error.
+    pub fn new(source: hyper::Error) -> Self {
+        debug_assert!(source.is_canceled());
+        Self { source }
+    }
 }
 
 // === impl Connect ===
@@ -123,17 +150,44 @@ where
                     builder.max_send_buf_size(sz);
                 }
 
-                let (tx, conn) = builder
+                let (tx, mut conn) = builder
                     .handshake(hyper_util::rt::TokioIo::new(io))
                     .instrument(trace_span!("handshake").or_current())
                     .await?;
 
+                let peer_goaway = Arc::new(AtomicBool::new(false));
                 tokio::spawn(
-                    conn.map_err(|error| debug!(%error, "failed"))
-                        .instrument(trace_span!("conn").or_current()),
+                    {
+                        let peer_goaway = peer_goaway.clone();
+                        async move {
+                            // Requests queued in the dispatcher are canceled
+                            // when `conn` is dropped, so record how the
+                            // connection ended while holding it alive: their
+                            // errors must be able to observe the flag.
+                            match (&mut conn).await {
+                                // Resolving without an error means the
+                                // dispatcher shut down cleanly--most commonly
+                                // on the peer's graceful GOAWAY, though a
+                                // dropped `SendRequest` or an
+                                // already-terminated connection also land
+                                // here. Those two only occur once the
+                                // dispatch queue is empty, so a request
+                                // canceled afterwards was never written and
+                                // marking it stays conservative.
+                                Ok(()) => peer_goaway.store(true, Ordering::Release),
+                                Err(error) => {
+                                    let goaway = cause_ref::<H2Error>(&error)
+                                        .is_some_and(|e| e.is_go_away() && e.is_remote());
+                                    peer_goaway.store(goaway, Ordering::Release);
+                                    debug!(%error, "failed");
+                                }
+                            }
+                        }
+                    }
+                    .instrument(trace_span!("conn").or_current()),
                 );
 
-                Ok(Connection { tx })
+                Ok(Connection { tx, peer_goaway })
             }
             .instrument(debug_span!("h2").or_current()),
         )
@@ -141,6 +195,26 @@ where
 }
 
 // === impl Connection ===
+
+impl<B> Connection<B> {
+    /// Returns a function that wraps this connection's request errors into
+    /// `linkerd_error::Error`, marking cancelations caused by the peer's
+    /// GOAWAY with [`GoAwayCanceled`]. hyper only cancels requests it never
+    /// wrote to the connection, and it does so without recording why the
+    /// connection went away, so the connection task's attribution is the only
+    /// signal available.
+    pub(crate) fn mark_goaway_cancelations(
+        &self,
+    ) -> impl Fn(hyper::Error) -> Error + Send + 'static {
+        let peer_goaway = self.peer_goaway.clone();
+        move |error| {
+            if error.is_canceled() && peer_goaway.load(Ordering::Acquire) {
+                return GoAwayCanceled::new(error).into();
+            }
+            error.into()
+        }
+    }
+}
 
 impl<B> tower::Service<http::Request<B>> for Connection<B>
 where
@@ -175,3 +249,6 @@ where
         self.tx.send_request(req).boxed()
     }
 }
+
+#[cfg(test)]
+mod tests;
