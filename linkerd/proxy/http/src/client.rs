@@ -157,13 +157,99 @@ where
             match self {
                 Self::Http1(ref mut svc) => svc.call(req),
                 Self::OrigProtoUpgrade(ref mut svc) => svc.call(req).map_err(Into::into).boxed(),
-                Self::H2(ref mut svc) => Box::pin(
-                    svc.call(req)
-                        .err_into::<Error>()
-                        .map_ok(|rsp| rsp.map(BoxBody::new)),
-                ) as RspFuture,
+                Self::H2(ref mut svc) => {
+                    // hyper only cancels requests it never wrote to the
+                    // connection, and it does so without recording why the
+                    // connection went away. Mark the cancelations caused by a
+                    // peer's GOAWAY so that they can be classified upstack,
+                    // e.g. as retryable.
+                    let mark_goaway = svc.mark_goaway_cancelations();
+                    Box::pin(
+                        svc.call(req)
+                            .map_err(mark_goaway)
+                            .map_ok(|rsp| rsp.map(BoxBody::new)),
+                    ) as RspFuture
+                }
             }
         })
         .instrument(span.or_current())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use linkerd_error::cause_ref;
+    use std::sync::Arc;
+
+    /// A request that a peer's GOAWAY abandoned in hyper's dispatch queue
+    /// fails with an error marked by [`h2::GoAwayCanceled`].
+    ///
+    /// This drives the whole HTTP/2 client path against a real server's
+    /// graceful shutdown: the queued request, the connection task's
+    /// attribution of the shutdown, and this module's error mapping.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn h2_marks_requests_abandoned_by_a_peer_goaway() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client_io = Arc::new(tokio::sync::Mutex::new(Some(client_io)));
+        let connect = linkerd_stack::service_fn(move |_: (crate::Variant, ())| {
+            let io = client_io
+                .try_lock()
+                .expect("uncontended")
+                .take()
+                .expect("only one connection");
+            futures::future::ok::<_, Error>((io, ()))
+        });
+
+        // The server advertises no stream capacity, so hyper's dispatcher
+        // cannot write the request to the connection and it remains queued.
+        // Once signaled, the server performs the graceful shutdown that a
+        // grpc-go server does when it enforces `MaxConnectionAge`.
+        let (shutdown, wait) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut srv = ::h2::server::Builder::new()
+                .max_concurrent_streams(0)
+                .handshake::<_, bytes::Bytes>(server_io)
+                .await
+                .expect("server handshake must succeed");
+            tokio::select! {
+                accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
+                _ = wait => {}
+            }
+            srv.graceful_shutdown();
+            while let Some(Ok(_)) = srv.accept().await {}
+        });
+
+        let mut client: Client<_, _, BoxBody> = MakeClient {
+            connect,
+            params: |_: &()| Params::H2(h2::ClientParams::default()),
+            _marker: PhantomData,
+        }
+        .oneshot(())
+        .await
+        .expect("client must connect");
+
+        let rsp = client
+            .ready()
+            .await
+            .expect("client must be ready")
+            .call(http_get());
+
+        shutdown.send(()).expect("server must await the shutdown");
+        server.await.expect("server task must not panic");
+
+        let error = rsp.await.expect_err("request must fail");
+        cause_ref::<h2::GoAwayCanceled>(&*error)
+            .expect("cancelation must be marked as caused by the peer's GOAWAY");
+        let hyper = cause_ref::<hyper::Error>(&*error).expect("must be caused by hyper's client");
+        assert!(hyper.is_canceled(), "must be canceled: {hyper:?}");
+    }
+
+    fn http_get() -> http::Request<BoxBody> {
+        http::Request::builder()
+            .version(::http::Version::HTTP_2)
+            .uri("http://server.test/")
+            .body(BoxBody::default())
+            .expect("request must be valid")
     }
 }
