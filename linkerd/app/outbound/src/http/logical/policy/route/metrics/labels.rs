@@ -332,15 +332,12 @@ impl Error {
             if h2e.is_go_away() {
                 return Ok(Self::GoAway);
             }
+            if h2e.reason() == Some(Reason::REFUSED_STREAM) {
+                return Ok(Self::Refused);
+            }
             if h2e.is_io() {
                 return Ok(Self::Io);
             }
-        }
-
-        // A cancelation attributed to a peer's GOAWAY carries no h2 error, so
-        // it is labeled here rather than in the block above.
-        if errors::is_caused_by::<http::h2::GoAwayCanceled>(&**error) {
-            return Ok(Self::GoAway);
         }
 
         tracing::debug!(?error, "Unlabeled error");
@@ -369,23 +366,11 @@ impl EncodeLabelValue for Error {
     }
 }
 
-/// A GOAWAY cancelation carries no h2 error, so without its own branch it
-/// would fall through to the unknown label.
 #[cfg(test)]
-#[tokio::test(flavor = "current_thread")]
-async fn goaway_canceled_is_labeled() {
-    let (client_io, _server_io) = tokio::io::duplex(1024);
-    let (mut tx, conn) = hyper::client::conn::http2::Builder::new(http::TokioExecutor::new())
-        .handshake::<_, http::BoxBody>(hyper_util::rt::TokioIo::new(client_io))
-        .await
-        .expect("client handshake must succeed");
-
-    // Queue a request and drop the dispatcher so that hyper cancels it.
-    let fut = tx.send_request(::http::Request::new(Default::default()));
-    drop(tx);
-    drop(conn);
-    let canceled = fut.await.expect_err("request must be canceled");
-
-    let error: BoxError = http::h2::GoAwayCanceled::new(canceled).into();
-    assert!(matches!(Error::new_or_status(&error), Ok(Error::GoAway)));
+#[test]
+fn locally_refused_request_is_labeled() {
+    let refused = http::h2::H2Error::from(http::h2::Reason::REFUSED_STREAM);
+    assert!(!refused.is_reset());
+    let error: BoxError = refused.into();
+    assert!(matches!(Error::new_or_status(&error), Ok(Error::Refused)));
 }

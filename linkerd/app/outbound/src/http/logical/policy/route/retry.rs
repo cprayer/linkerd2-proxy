@@ -148,17 +148,6 @@ impl RetryPolicy {
             }
         }
 
-        // A canceled request was abandoned by hyper's client before it could
-        // be written to a connection, so retrying cannot cause duplicate
-        // processing. hyper does not record why the connection went away, so
-        // the h2 client marks the cancelations its connection task attributes
-        // to a peer's GOAWAY; other cancelations--e.g. from an I/O error--are
-        // not retried. The h1 client has no comparable signal, so its
-        // cancelations are not marked and therefore not retried either.
-        if is_caused_by::<h2::GoAwayCanceled>(&**error) {
-            return true;
-        }
-
         // TODO(ver) connection errors require changes to the endpoint stack so
         // that they can be inspected. here.
 

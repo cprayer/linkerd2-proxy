@@ -405,7 +405,8 @@ async fn http_h2_goaway_canceled_respects_policy() {
         )
         .await
         .expect_err("policy must prevent retry");
-        assert!(errors::is_caused_by::<http::h2::GoAwayCanceled>(&*error));
+        let h2 = errors::cause_ref::<http::h2::H2Error>(&*error).expect("HTTP/2 error");
+        assert_eq!(h2.reason(), Some(http::h2::Reason::REFUSED_STREAM));
     }
 }
 
@@ -665,10 +666,8 @@ async fn mk_h2_goaway_canceled() -> Error {
     server.await.expect("server task must not panic");
 
     let err = rsp.await.expect_err("request must be canceled");
-    assert!(errors::is_caused_by::<http::h2::GoAwayCanceled>(&*err));
-    assert!(errors::cause_ref::<hyper::Error>(&*err)
-        .expect("caused by hyper")
-        .is_canceled());
+    let h2 = errors::cause_ref::<http::h2::H2Error>(&*err).expect("HTTP/2 error");
+    assert_eq!(h2.reason(), Some(http::h2::Reason::REFUSED_STREAM));
     err
 }
 
@@ -676,7 +675,7 @@ async fn mk_h2_goaway_canceled() -> Error {
 /// whose dispatcher goes away without a peer GOAWAY, e.g. because the
 /// connection failed with an I/O error. hyper cancels the request exactly as
 /// in the GOAWAY case, so nothing distinguishes the two at this layer; the
-/// h2 client's connection task only marks the GOAWAY case.
+/// h2 client's connection task only refuses the GOAWAY case.
 async fn mk_h2_canceled_no_goaway() -> Error {
     let (client_io, _server_io) = io::duplex(64 * 1024);
     let (mut tx, conn) = mk_h2_client(client_io).await;
