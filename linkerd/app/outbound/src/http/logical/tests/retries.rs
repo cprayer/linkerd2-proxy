@@ -3,7 +3,7 @@ use http_body_util::BodyExt;
 use linkerd_app_core::{
     errors, io,
     proxy::http::{self, StatusCode},
-    svc::http::stream_timeouts::StreamDeadlineError,
+    svc::{http::stream_timeouts::StreamDeadlineError, Service},
     trace,
 };
 use linkerd_proxy_client_policy::{
@@ -316,7 +316,7 @@ async fn http_h2_goaway_canceled() {
         svc,
         handle,
         http_get(),
-        mk_h2_goaway_canceled(),
+        mk_h2_goaway_canceled().await,
         mk_rsp(StatusCode::NO_CONTENT, ""),
     )
     .await;
@@ -337,7 +337,7 @@ async fn http_h2_canceled_without_goaway() {
         svc,
         handle,
         http_get(),
-        mk_h2_canceled_no_goaway(),
+        mk_h2_canceled_no_goaway().await,
         mk_rsp(StatusCode::NO_CONTENT, ""),
     )
     .await
@@ -368,11 +368,45 @@ async fn grpc_h2_goaway_canceled() {
         http::Request::post("/svc/method")
             .body(Default::default())
             .unwrap(),
-        mk_h2_goaway_canceled(),
+        mk_h2_goaway_canceled().await,
         mk_grpc_rsp(tonic::Code::Ok),
     )
     .await;
-    assert_eq!(rsp.expect("response").status(), StatusCode::OK);
+    let rsp = rsp.expect("response");
+    assert_eq!(rsp.status(), StatusCode::OK);
+    let body = rsp.into_body().collect().await.expect("response body");
+    assert_eq!(body.trailers().expect("gRPC trailers")["grpc-status"], "0");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_goaway_canceled_respects_policy() {
+    for (retry, body) in [
+        (None, "".to_owned()),
+        (
+            Some(client_policy::http::Retry {
+                max_retries: 0,
+                ..mk_http_retry()
+            }),
+            "".to_owned(),
+        ),
+        (Some(mk_http_retry()), "x".repeat(1001)),
+    ] {
+        let (svc, handle) = mock_http(HttpParams {
+            retry,
+            ..Default::default()
+        });
+        let req = http::Request::post("/").body(BoxBody::new(body)).unwrap();
+        let error = retry_canceled(
+            svc,
+            handle,
+            req,
+            mk_h2_goaway_canceled().await,
+            mk_rsp(StatusCode::NO_CONTENT, ""),
+        )
+        .await
+        .expect_err("policy must prevent retry");
+        assert!(errors::is_caused_by::<http::h2::GoAwayCanceled>(&*error));
+    }
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -543,7 +577,7 @@ async fn retry_canceled(
     svc: svc::BoxCloneHttp,
     mut handle: Handle,
     req: ::http::Request<BoxBody>,
-    error: impl Future<Output = Error> + Send + 'static,
+    error: Error,
     retried: impl Future<Output = Result<Response>> + Send + 'static,
 ) -> Result<Response> {
     const TIMEOUT: time::Duration = time::Duration::from_secs(2);
@@ -552,7 +586,7 @@ async fn retry_canceled(
         async move {
             handle.allow(2);
             info!("Failing the first request with a canceled dispatch");
-            serve(&mut handle, async move { Err(error.await) }).await;
+            serve(&mut handle, async move { Err(error) }).await;
             info!("Serving the second request");
             serve(&mut handle, retried).await;
             handle
@@ -588,46 +622,54 @@ async fn mk_h2_client(
 /// written to it, as a grpc-go server does when it enforces `MaxConnectionAge`.
 async fn mk_h2_goaway_canceled() -> Error {
     let (client_io, server_io) = io::duplex(64 * 1024);
-    let (mut tx, conn) = mk_h2_client(client_io).await;
-
-    // Queue a request; this only places it on hyper's dispatch channel. The
-    // dispatcher (`conn`) is not polled until after the server has shut down,
-    // so the request provably never reaches the connection.
-    let fut = tx.send_request(http_post());
-    drop(tx);
-
-    // Run a real server through the same two-phase graceful shutdown that
-    // grpc-go's MaxConnectionAge enforcement performs: GOAWAY(2^31-1,
-    // NO_ERROR), a shutdown PING, then GOAWAY(last-stream-id, NO_ERROR).
-    // hyper's connection task (spawned by the handshake above) answers the
-    // PING, so awaiting the server task guarantees that the whole frame
-    // exchange completed on the wire.
-    tokio::spawn(
-        async move {
-            let mut srv = h2::server::handshake(server_io)
-                .await
-                .expect("server handshake must succeed");
-            srv.graceful_shutdown();
-            while let Some(Ok(_)) = srv.accept().await {}
+    let client_io = Arc::new(Mutex::new(Some(client_io)));
+    let connect = svc::service_fn(move |_: (http::Variant, ())| {
+        futures::future::ok::<_, Error>((client_io.lock().take().expect("only one connection"), ()))
+    });
+    let (shutdown, wait) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut srv = h2::server::Builder::new()
+            .max_concurrent_streams(0)
+            .handshake::<_, bytes::Bytes>(server_io)
+            .await
+            .expect("server handshake must succeed");
+        tokio::select! {
+            accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
+            _ = wait => {}
         }
-        .in_current_span(),
-    )
-    .await
-    .expect("server task must not panic");
+        srv.graceful_shutdown();
+        match srv.accept().await {
+            Some(Ok(_)) => panic!("server must not accept a stream during shutdown"),
+            Some(Err(error)) => assert!(error
+                .get_io()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)),
+            None => {}
+        }
+    });
+    let mut client = svc::stack(connect)
+        .push(http::client::layer_via(|_: &()| {
+            http::client::Params::H2(http::h2::ClientParams::default())
+        }))
+        .into_inner()
+        .oneshot(())
+        .await
+        .expect("client must connect");
+    let mut req = http_post();
+    *req.version_mut() = ::http::Version::HTTP_2;
+    let rsp = client
+        .ready()
+        .await
+        .expect("client must be ready")
+        .call(req);
+    shutdown.send(()).expect("server must await shutdown");
+    server.await.expect("server task must not panic");
 
-    // Once polled, the dispatcher observes the GOAWAY, shuts down cleanly
-    // (NO_ERROR), and abandons the queued request.
-    let (conn, res) = tokio::join!(conn, fut);
-    conn.expect("dispatcher must shut down cleanly on a NO_ERROR GOAWAY");
-    let err = res.expect_err("request must be canceled");
-    assert!(err.is_canceled(), "error must be canceled: {err:?}");
-    assert!(
-        errors::cause_ref::<errors::H2Error>(&err).is_none(),
-        "error must not carry an h2 error: {err:?}"
-    );
-    // The h2 client's connection task observes the clean shutdown and marks
-    // the cancelation as caused by the peer's GOAWAY.
-    http::h2::GoAwayCanceled::new(err).into()
+    let err = rsp.await.expect_err("request must be canceled");
+    assert!(errors::is_caused_by::<http::h2::GoAwayCanceled>(&*err));
+    assert!(errors::cause_ref::<hyper::Error>(&*err)
+        .expect("caused by hyper")
+        .is_canceled());
+    err
 }
 
 /// Builds the error hyper produces when a request is queued onto a connection
