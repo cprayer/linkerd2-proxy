@@ -32,26 +32,6 @@ pub struct Connection<B> {
     peer_goaway: Arc<AtomicBool>,
 }
 
-/// The error produced for a request that hyper canceled--i.e., abandoned
-/// before it could be written to a connection--because the peer's GOAWAY shut
-/// the connection down.
-#[derive(Debug, thiserror::Error)]
-#[error("request canceled by the peer's GOAWAY: {source}")]
-pub struct GoAwayCanceled {
-    #[source]
-    source: hyper::Error,
-}
-
-// === impl GoAwayCanceled ===
-
-impl GoAwayCanceled {
-    /// Public so that tests in other crates can synthesize this error.
-    pub fn new(source: hyper::Error) -> Self {
-        debug_assert!(source.is_canceled());
-        Self { source }
-    }
-}
-
 // === impl Connect ===
 
 impl<C, B> Connect<C, B> {
@@ -173,7 +153,7 @@ where
                                 // here. Those two only occur once the
                                 // dispatch queue is empty, so a request
                                 // canceled afterwards was never written and
-                                // marking it stays conservative.
+                                // refusing it stays conservative.
                                 Ok(()) => peer_goaway.store(true, Ordering::Release),
                                 Err(error) => {
                                     let goaway = cause_ref::<H2Error>(&error)
@@ -197,19 +177,13 @@ where
 // === impl Connection ===
 
 impl<B> Connection<B> {
-    /// Returns a function that wraps this connection's request errors into
-    /// `linkerd_error::Error`, marking cancelations caused by the peer's
-    /// GOAWAY with [`GoAwayCanceled`]. hyper only cancels requests it never
-    /// wrote to the connection, and it does so without recording why the
-    /// connection went away, so the connection task's attribution is the only
-    /// signal available.
-    pub(crate) fn mark_goaway_cancelations(
-        &self,
-    ) -> impl Fn(hyper::Error) -> Error + Send + 'static {
+    /// Refuses requests canceled before hyper wrote them to the connection
+    /// when the connection task attributes its shutdown to a peer's GOAWAY.
+    pub(crate) fn rescue_goaway(&self) -> impl Fn(hyper::Error) -> Error + Send + 'static {
         let peer_goaway = self.peer_goaway.clone();
         move |error| {
             if error.is_canceled() && peer_goaway.load(Ordering::Acquire) {
-                return GoAwayCanceled::new(error).into();
+                return H2Error::from(Reason::REFUSED_STREAM).into();
             }
             error.into()
         }

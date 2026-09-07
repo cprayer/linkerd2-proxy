@@ -46,7 +46,7 @@ async fn shut_down(server_io: tokio::io::DuplexStream, reason: Option<::h2::Reas
 }
 
 /// Issues a request that hyper cancels because the connection is gone, and
-/// returns the error with this connection's marking applied.
+/// returns the error with this connection's error mapping applied.
 async fn canceled_request(conn: &mut Connection<BoxBody>) -> Error {
     // With the clock paused, time only advances once every task is idle,
     // so the connection task has necessarily observed the shutdown.
@@ -57,53 +57,88 @@ async fn canceled_request(conn: &mut Connection<BoxBody>) -> Error {
         .await
         .expect_err("request must be canceled");
     assert!(error.is_canceled(), "must be canceled: {error:?}");
-    conn.mark_goaway_cancelations()(error)
+    conn.rescue_goaway()(error)
 }
 
 /// A request canceled because the peer's graceful GOAWAY shut the
-/// connection down is marked. This drives the cancelation hyper produces
+/// connection down is refused. This drives the cancelation hyper produces
 /// for a request issued after the shutdown; the cancelation of a request
 /// already queued in the dispatcher is covered by
-/// `client::tests::h2_marks_requests_abandoned_by_a_peer_goaway`.
+/// `client::tests::h2_refuses_requests_abandoned_by_a_peer_goaway`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn marks_canceled_requests_on_peer_goaway() {
+async fn refuses_canceled_requests_on_peer_goaway() {
     let (mut conn, server_io) = connect().await;
     shut_down(server_io, None).await;
 
-    let marked = canceled_request(&mut conn).await;
-    let goaway = linkerd_error::cause_ref::<GoAwayCanceled>(&*marked)
-        .expect("cancelation must be marked as caused by the GOAWAY");
-    assert!(goaway.source.is_canceled(), "must be canceled: {goaway:?}");
+    let error = canceled_request(&mut conn).await;
+    let h2 = linkerd_error::cause_ref::<H2Error>(&*error).expect("must carry an HTTP/2 error");
+    assert_eq!(h2.reason(), Some(Reason::REFUSED_STREAM));
 }
 
 /// A peer's GOAWAY carrying an error code ends the connection with an
 /// error rather than cleanly, so it exercises the other branch of the
 /// connection task's attribution.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn marks_canceled_requests_on_peer_goaway_error() {
+async fn refuses_canceled_requests_on_peer_goaway_error() {
     let (mut conn, server_io) = connect().await;
     shut_down(server_io, Some(::h2::Reason::ENHANCE_YOUR_CALM)).await;
 
-    let marked = canceled_request(&mut conn).await;
-    linkerd_error::cause_ref::<GoAwayCanceled>(&*marked)
-        .expect("cancelation must be marked as caused by the GOAWAY");
+    let error = canceled_request(&mut conn).await;
+    let h2 = linkerd_error::cause_ref::<H2Error>(&*error).expect("must carry an HTTP/2 error");
+    assert_eq!(h2.reason(), Some(Reason::REFUSED_STREAM));
 }
 
 /// A request canceled because the connection failed without a peer GOAWAY
-/// surfaces hyper's error unmarked.
+/// preserves hyper's original error.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn does_not_mark_canceled_requests_without_goaway() {
+async fn does_not_refuse_canceled_requests_without_goaway() {
     let (mut conn, server_io) = connect().await;
 
     // The server closes the connection without sending a GOAWAY.
     drop(server_io);
 
-    let marked = canceled_request(&mut conn).await;
+    let error = canceled_request(&mut conn).await;
     assert!(
-        linkerd_error::cause_ref::<GoAwayCanceled>(&*marked).is_none(),
-        "cancelation must not be attributed to a GOAWAY: {marked:?}"
+        linkerd_error::cause_ref::<H2Error>(&*error).is_none(),
+        "cancelation must not be attributed to a GOAWAY: {error:?}"
     );
-    let hyper = linkerd_error::cause_ref::<hyper::Error>(&*marked)
+    let hyper = linkerd_error::cause_ref::<hyper::Error>(&*error)
         .expect("must be caused by hyper's client");
     assert!(hyper.is_canceled(), "must be canceled: {hyper:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_not_refuse_an_accepted_request_on_goaway() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (mut conn, server_io) = connect().await;
+        let server = tokio::spawn(async move {
+            let mut srv = ::h2::server::handshake(server_io).await.unwrap();
+            let (_request, _respond) = srv.accept().await.unwrap().unwrap();
+            srv.abrupt_shutdown(Reason::INTERNAL_ERROR);
+            while let Some(Ok(_)) = srv.accept().await {}
+        });
+        let rescue_goaway = conn.rescue_goaway();
+        let error = conn
+            .ready()
+            .await
+            .unwrap()
+            .call(http_get())
+            .await
+            .unwrap_err();
+        assert!(
+            !error.is_canceled(),
+            "accepted request must not be canceled: {error:?}"
+        );
+        server.await.unwrap();
+        while !conn.peer_goaway.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let original = format!("{error:?}");
+        let error = rescue_goaway(error);
+        let hyper = linkerd_error::cause_ref::<hyper::Error>(&*error)
+            .expect("accepted request must preserve hyper's original error");
+        assert_eq!(format!("{hyper:?}"), original);
+    })
+    .await
+    .expect("request must finish");
 }
