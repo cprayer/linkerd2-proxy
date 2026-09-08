@@ -195,6 +195,12 @@ fn http_get() -> http::Request<BoxBody> {
     http::Request::get("/").body(Default::default()).unwrap()
 }
 
+fn http_post() -> http::Request<BoxBody> {
+    http::Request::post("http://server.test/")
+        .body(Default::default())
+        .unwrap()
+}
+
 fn default_backend(path: impl ToString) -> client_policy::Backend {
     use client_policy::{
         Backend, BackendDispatcher, EndpointDiscovery, Load, Meta, PeakEwma, Queue,

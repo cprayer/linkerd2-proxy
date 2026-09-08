@@ -157,13 +157,114 @@ where
             match self {
                 Self::Http1(ref mut svc) => svc.call(req),
                 Self::OrigProtoUpgrade(ref mut svc) => svc.call(req).map_err(Into::into).boxed(),
-                Self::H2(ref mut svc) => Box::pin(
-                    svc.call(req)
-                        .err_into::<Error>()
-                        .map_ok(|rsp| rsp.map(BoxBody::new)),
-                ) as RspFuture,
+                Self::H2(ref mut svc) => {
+                    let rescue_goaway = svc.rescue_goaway();
+                    Box::pin(
+                        svc.call(req)
+                            .map_err(rescue_goaway)
+                            .map_ok(|rsp| rsp.map(BoxBody::new)),
+                    ) as RspFuture
+                }
             }
         })
         .instrument(span.or_current())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use linkerd_error::cause_ref;
+    use std::sync::Arc;
+    use tokio::time::{self, Duration};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// A request that a peer's GOAWAY abandoned in hyper's dispatch queue
+    /// fails with REFUSED_STREAM so its caller can retry it.
+    ///
+    /// This drives the whole HTTP/2 client path against a real server's
+    /// graceful shutdown: the queued request, the connection task's
+    /// attribution of the shutdown, and this module's error mapping.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn h2_refuses_queued_requests_on_goaway() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client_io = Arc::new(tokio::sync::Mutex::new(Some(client_io)));
+        let connect = linkerd_stack::service_fn(move |_: (crate::Variant, ())| {
+            let io = client_io
+                .try_lock()
+                .expect("uncontended")
+                .take()
+                .expect("only one connection");
+            futures::future::ok::<_, Error>((io, ()))
+        });
+
+        // The server advertises no stream capacity, so hyper's dispatcher
+        // cannot write the request to the connection and it remains queued.
+        // Once signaled, the server performs the graceful shutdown that a
+        // grpc-go server does when it enforces `MaxConnectionAge`.
+        let (shutdown, wait) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut srv = ::h2::server::Builder::new()
+                .max_concurrent_streams(0)
+                .handshake::<_, bytes::Bytes>(server_io)
+                .await
+                .expect("server handshake must succeed");
+            tokio::select! {
+                accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
+                _ = wait => {}
+            }
+            srv.graceful_shutdown();
+            match srv.accept().await {
+                Some(Ok(_)) => panic!("server must not accept a stream during shutdown"),
+                Some(Err(error)) => assert!(
+                    error
+                        .get_io()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe),
+                    "unexpected server shutdown error: {error:?}"
+                ),
+                None => {}
+            }
+        });
+
+        let mut client: Client<_, _, BoxBody> = time::timeout(
+            TIMEOUT,
+            MakeClient {
+                connect,
+                params: |_: &()| Params::H2(h2::ClientParams::default()),
+                _marker: PhantomData,
+            }
+            .oneshot(()),
+        )
+        .await
+        .expect("client handshake timed out")
+        .expect("client must connect");
+
+        let rsp = time::timeout(TIMEOUT, client.ready())
+            .await
+            .expect("client readiness timed out")
+            .expect("client must be ready")
+            .call(http_get());
+
+        shutdown.send(()).expect("server must await the shutdown");
+        time::timeout(TIMEOUT, server)
+            .await
+            .expect("server shutdown timed out")
+            .expect("server task must not panic");
+
+        let error = time::timeout(TIMEOUT, rsp)
+            .await
+            .expect("request timed out")
+            .expect_err("request must fail");
+        let h2 = cause_ref::<h2::H2Error>(&*error).expect("must carry an HTTP/2 error");
+        assert_eq!(h2.reason(), Some(h2::Reason::REFUSED_STREAM));
+    }
+
+    fn http_get() -> http::Request<BoxBody> {
+        http::Request::builder()
+            .version(::http::Version::HTTP_2)
+            .uri("http://server.test/")
+            .body(BoxBody::default())
+            .expect("request must be valid")
     }
 }

@@ -103,6 +103,20 @@ async fn http_request_statuses() {
     })
     .await;
 
+    let refused = statuses.metric(&labels::Rsp(
+        labels::Route::new(parent_ref.clone(), route_ref.clone(), None),
+        labels::HttpRsp {
+            status: None,
+            error: Some(labels::Error::Refused),
+        },
+    ));
+    send_assert_incremented(&refused, &mut handle, &mut svc, Default::default(), |tx| {
+        let error = crate::http::h2::H2Error::from(crate::http::h2::Reason::REFUSED_STREAM);
+        assert!(!error.is_reset());
+        tx.send_error(error)
+    })
+    .await;
+
     // Emit a successful response with a body that fails and ensure that both
     // the status and error are recorded.
     let mixed = statuses.metric(&labels::Rsp(
@@ -125,6 +139,7 @@ async fn http_request_statuses() {
     assert_eq!(ok.get(), 1);
     assert_eq!(no_content.get(), 1);
     assert_eq!(unknown.get(), 1);
+    assert_eq!(refused.get(), 1);
     assert_eq!(mixed.get(), 1);
 }
 

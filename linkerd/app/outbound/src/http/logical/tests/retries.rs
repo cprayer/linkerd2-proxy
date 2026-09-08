@@ -1,9 +1,9 @@
 use super::*;
 use http_body_util::BodyExt;
 use linkerd_app_core::{
-    errors,
+    errors, io,
     proxy::http::{self, StatusCode},
-    svc::http::stream_timeouts::StreamDeadlineError,
+    svc::{http::stream_timeouts::StreamDeadlineError, Service},
     trace,
 };
 use linkerd_proxy_client_policy::{
@@ -302,6 +302,121 @@ async fn http_timeout_with_request_timeout() {
     assert!(errors::is_caused_by::<StreamDeadlineError>(&*error));
 }
 
+/// Reproduces linkerd/linkerd2#12964: a request abandoned by a graceful
+/// GOAWAY was never written to the connection, so it is retried.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_goaway_canceled() {
+    let _trace = trace::test::trace_init();
+    let (svc, handle) = mock_http(HttpParams {
+        retry: Some(mk_http_retry()),
+        ..Default::default()
+    });
+
+    let rsp = retry_canceled(
+        svc,
+        handle,
+        http_get(),
+        mk_h2_goaway_canceled().await,
+        mk_rsp(StatusCode::NO_CONTENT, ""),
+    )
+    .await;
+    assert_eq!(rsp.expect("response").status(), StatusCode::NO_CONTENT);
+}
+
+/// A canceled request that the h2 client did not attribute to a peer's GOAWAY
+/// is not retried, even though a second response is available.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_canceled_without_goaway() {
+    let _trace = trace::test::trace_init();
+    let (svc, handle) = mock_http(HttpParams {
+        retry: Some(mk_http_retry()),
+        ..Default::default()
+    });
+
+    let error = retry_canceled(
+        svc,
+        handle,
+        http_get(),
+        mk_h2_canceled_no_goaway().await,
+        mk_rsp(StatusCode::NO_CONTENT, ""),
+    )
+    .await
+    .expect_err("response should fail");
+    let cause = errors::cause_ref::<hyper::Error>(&*error).expect("caused by hyper");
+    assert!(cause.is_canceled(), "cause must be canceled: {cause:?}");
+}
+
+/// A gRPC request abandoned by a graceful GOAWAY is retried, though no
+/// response--and so no gRPC status--was ever received.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn grpc_h2_goaway_canceled() {
+    let _trace = trace::test::trace_init();
+    let (svc, handle) = mock_grpc(GrpcParams {
+        retry: Some(client_policy::grpc::Retry {
+            max_retries: 1,
+            codes: Codes(Default::default()),
+            max_request_bytes: 1000,
+            timeout: None,
+            backoff: None,
+        }),
+        ..Default::default()
+    });
+
+    let rsp = retry_canceled(
+        svc,
+        handle,
+        http::Request::post("/svc/method")
+            .body(Default::default())
+            .unwrap(),
+        mk_h2_goaway_canceled().await,
+        mk_grpc_rsp(tonic::Code::Ok),
+    )
+    .await;
+    let rsp = rsp.expect("response");
+    assert_eq!(rsp.status(), StatusCode::OK);
+    let body = rsp.into_body().collect().await.expect("response body");
+    assert_eq!(body.trailers().expect("gRPC trailers")["grpc-status"], "0");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_goaway_canceled_respects_policy() {
+    let _trace = trace::test::trace_init();
+    for (case, retry, body) in [
+        ("no_retry_policy", None, "".to_owned()),
+        (
+            "zero_retries",
+            Some(client_policy::http::Retry {
+                max_retries: 0,
+                ..mk_http_retry()
+            }),
+            "".to_owned(),
+        ),
+        ("body_too_large", Some(mk_http_retry()), "x".repeat(1001)),
+    ] {
+        let (svc, handle) = mock_http(HttpParams {
+            retry,
+            ..Default::default()
+        });
+        let req = http::Request::post("/").body(BoxBody::new(body)).unwrap();
+        let error = retry_canceled(
+            svc,
+            handle,
+            req,
+            mk_h2_goaway_canceled().await,
+            mk_rsp(StatusCode::NO_CONTENT, ""),
+        )
+        .await
+        .expect_err(&format!("policy must prevent retry: {case}"));
+        let h2 = errors::cause_ref::<http::h2::H2Error>(&*error)
+            .unwrap_or_else(|| panic!("expected HTTP/2 error for {case}: {error:?}"));
+        assert_eq!(
+            h2.reason(),
+            Some(http::h2::Reason::REFUSED_STREAM),
+            "{case}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn grpc_internal() {
     let _trace = trace::test::with_default_filter("linkerd=debug");
@@ -449,4 +564,154 @@ async fn grpc_timeout() {
             .unwrap(),
         "0"
     );
+}
+
+// === Utils ===
+
+const H2_TIMEOUT: time::Duration = time::Duration::from_secs(5);
+
+fn mk_http_retry() -> client_policy::http::Retry {
+    client_policy::http::Retry {
+        max_retries: 1,
+        status_ranges: Default::default(),
+        max_request_bytes: 1000,
+        timeout: None,
+        backoff: None,
+    }
+}
+
+/// Fails the first request with `error` and makes `retried` available to a
+/// second, so that the response observed by the caller distinguishes a request
+/// that was retried from one that was not.
+async fn retry_canceled(
+    svc: svc::BoxCloneHttp,
+    mut handle: Handle,
+    req: ::http::Request<BoxBody>,
+    error: Error,
+    retried: impl Future<Output = Result<Response>> + Send + 'static,
+) -> Result<Response> {
+    const TIMEOUT: time::Duration = time::Duration::from_secs(2);
+
+    tokio::spawn(
+        async move {
+            handle.allow(2);
+            info!("Failing the first request with a canceled dispatch");
+            serve(&mut handle, async move { Err(error) }).await;
+            info!("Serving the second request");
+            serve(&mut handle, retried).await;
+            handle
+        }
+        .in_current_span(),
+    );
+
+    time::timeout(TIMEOUT, send_req(svc, req))
+        .await
+        .expect("response")
+}
+
+type H2ClientConn = hyper::client::conn::http2::Connection<
+    hyper_util::rt::TokioIo<io::DuplexStream>,
+    BoxBody,
+    http::TokioExecutor,
+>;
+
+async fn mk_h2_client(
+    io: io::DuplexStream,
+) -> (
+    hyper::client::conn::http2::SendRequest<BoxBody>,
+    H2ClientConn,
+) {
+    time::timeout(
+        H2_TIMEOUT,
+        hyper::client::conn::http2::Builder::new(http::TokioExecutor::new())
+            .handshake::<_, BoxBody>(hyper_util::rt::TokioIo::new(io)),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client handshake must succeed")
+}
+
+/// Builds the REFUSED_STREAM error that Linkerd returns when a peer's graceful
+/// GOAWAY cancels a request before hyper writes it to the connection.
+async fn mk_h2_goaway_canceled() -> Error {
+    let (client_io, server_io) = io::duplex(64 * 1024);
+    let client_io = Arc::new(Mutex::new(Some(client_io)));
+    let connect = svc::service_fn(move |_: (http::Variant, ())| {
+        futures::future::ok::<_, Error>((client_io.lock().take().expect("only one connection"), ()))
+    });
+    let (shutdown, wait) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut srv = h2::server::Builder::new()
+            .max_concurrent_streams(0)
+            .handshake::<_, bytes::Bytes>(server_io)
+            .await
+            .expect("server handshake must succeed");
+        tokio::select! {
+            accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
+            _ = wait => {}
+        }
+        srv.graceful_shutdown();
+        match srv.accept().await {
+            Some(Ok(_)) => panic!("server must not accept a stream during shutdown"),
+            Some(Err(error)) => assert!(error
+                .get_io()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)),
+            None => {}
+        }
+    });
+    let mut client = time::timeout(
+        H2_TIMEOUT,
+        svc::stack(connect)
+            .push(http::client::layer_via(|_: &()| {
+                http::client::Params::H2(http::h2::ClientParams::default())
+            }))
+            .into_inner()
+            .oneshot(()),
+    )
+    .await
+    .expect("client handshake timed out")
+    .expect("client must connect");
+    let mut req = http_post();
+    *req.version_mut() = ::http::Version::HTTP_2;
+    let rsp = time::timeout(H2_TIMEOUT, client.ready())
+        .await
+        .expect("client readiness timed out")
+        .expect("client must be ready")
+        .call(req);
+    shutdown.send(()).expect("server must await shutdown");
+    time::timeout(H2_TIMEOUT, server)
+        .await
+        .expect("server shutdown timed out")
+        .expect("server task must not panic");
+
+    let err = time::timeout(H2_TIMEOUT, rsp)
+        .await
+        .expect("request timed out")
+        .expect_err("request must be canceled");
+    let h2 = errors::cause_ref::<http::h2::H2Error>(&*err).expect("HTTP/2 error");
+    assert_eq!(h2.reason(), Some(http::h2::Reason::REFUSED_STREAM));
+    err
+}
+
+/// Builds the error hyper produces when a request is queued onto a connection
+/// whose dispatcher goes away without a peer GOAWAY, e.g. because the
+/// connection failed with an I/O error. hyper cancels the request exactly as
+/// in the GOAWAY case, so nothing distinguishes the two at this layer; the
+/// h2 client's connection task only refuses the GOAWAY case.
+async fn mk_h2_canceled_no_goaway() -> Error {
+    let (client_io, _server_io) = io::duplex(64 * 1024);
+    let (mut tx, conn) = mk_h2_client(client_io).await;
+
+    // Queue a request, then drop the dispatcher with the request still
+    // queued: it is canceled without ever reaching the connection.
+    let fut = tx.send_request(http_post());
+    drop(tx);
+    drop(conn);
+
+    let err = time::timeout(H2_TIMEOUT, fut)
+        .await
+        .expect("request timed out")
+        .expect_err("request must be canceled");
+    assert!(err.is_canceled(), "error must be canceled: {err:?}");
+    err.into()
 }

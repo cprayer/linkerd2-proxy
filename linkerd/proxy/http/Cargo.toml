@@ -58,6 +58,12 @@ linkerd-stack = { path = "../../stack" }
 [dev-dependencies]
 bytes = { workspace = true }
 http-body-util = { workspace = true, features = ["channel"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }
 tower-test = { workspace = true }
 linkerd-tracing = { path = "../../tracing", features = ["ansi"] }
 

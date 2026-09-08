@@ -332,6 +332,9 @@ impl Error {
             if h2e.is_go_away() {
                 return Ok(Self::GoAway);
             }
+            if h2e.reason() == Some(Reason::REFUSED_STREAM) {
+                return Ok(Self::Refused);
+            }
             if h2e.is_io() {
                 return Ok(Self::Io);
             }
