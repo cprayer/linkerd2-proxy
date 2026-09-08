@@ -600,24 +600,6 @@ async fn retry_canceled(
         .expect("response")
 }
 
-type H2ClientConn = hyper::client::conn::http2::Connection<
-    hyper_util::rt::TokioIo<io::DuplexStream>,
-    BoxBody,
-    http::TokioExecutor,
->;
-
-async fn mk_h2_client(
-    io: io::DuplexStream,
-) -> (
-    hyper::client::conn::http2::SendRequest<BoxBody>,
-    H2ClientConn,
-) {
-    hyper::client::conn::http2::Builder::new(http::TokioExecutor::new())
-        .handshake::<_, BoxBody>(hyper_util::rt::TokioIo::new(io))
-        .await
-        .expect("client handshake must succeed")
-}
-
 /// Builds the error hyper produces when a request is queued onto a connection
 /// that the server terminates with a graceful GOAWAY before the request can be
 /// written to it, as a grpc-go server does when it enforces `MaxConnectionAge`.
@@ -678,7 +660,10 @@ async fn mk_h2_goaway_canceled() -> Error {
 /// h2 client's connection task only refuses the GOAWAY case.
 async fn mk_h2_canceled_no_goaway() -> Error {
     let (client_io, _server_io) = io::duplex(64 * 1024);
-    let (mut tx, conn) = mk_h2_client(client_io).await;
+    let (mut tx, conn) = hyper::client::conn::http2::Builder::new(http::TokioExecutor::new())
+        .handshake::<_, BoxBody>(hyper_util::rt::TokioIo::new(client_io))
+        .await
+        .expect("client handshake must succeed");
 
     // Queue a request, then drop the dispatcher with the request still
     // queued: it is canceled without ever reaching the connection.

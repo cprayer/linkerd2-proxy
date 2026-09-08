@@ -31,18 +31,14 @@ fn http_get() -> http::Request<BoxBody> {
 /// Runs a real server against `server_io` until it has shut down, so that
 /// the whole frame exchange has provably completed on the wire.
 async fn shut_down(server_io: tokio::io::DuplexStream, reason: Option<::h2::Reason>) {
-    tokio::spawn(async move {
-        let mut srv = ::h2::server::handshake(server_io)
-            .await
-            .expect("server handshake must succeed");
-        match reason {
-            None => srv.graceful_shutdown(),
-            Some(reason) => srv.abrupt_shutdown(reason),
-        }
-        while let Some(Ok(_)) = srv.accept().await {}
-    })
-    .await
-    .expect("server task must not panic");
+    let mut srv = ::h2::server::handshake(server_io)
+        .await
+        .expect("server handshake must succeed");
+    match reason {
+        None => srv.graceful_shutdown(),
+        Some(reason) => srv.abrupt_shutdown(reason),
+    }
+    while let Some(Ok(_)) = srv.accept().await {}
 }
 
 /// Issues a request that hyper cancels because the connection is gone, and
