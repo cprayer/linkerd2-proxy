@@ -196,7 +196,7 @@ fn http_get() -> http::Request<BoxBody> {
 }
 
 fn http_post() -> http::Request<BoxBody> {
-    http::Request::post("http://example.com/")
+    http::Request::post("http://server.test/")
         .body(Default::default())
         .unwrap()
 }
