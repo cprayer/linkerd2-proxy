@@ -41,70 +41,54 @@ async fn shut_down(server_io: tokio::io::DuplexStream, reason: Option<::h2::Reas
     while let Some(Ok(_)) = srv.accept().await {}
 }
 
-/// Issues a request that hyper cancels because the connection is gone, and
-/// returns the error with this connection's error mapping applied.
-async fn canceled_request(conn: &mut Connection<BoxBody>) -> Error {
-    // With the clock paused, time only advances once every task is idle,
-    // so the connection task has necessarily observed the shutdown.
+/// Issues a request after the connection task has observed the shutdown.
+async fn canceled_request(
+    conn: &mut Connection<BoxBody>,
+) -> hyper::client::conn::TrySendError<http::Request<BoxBody>> {
+    // With the clock paused, time only advances once every task is idle.
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
     let error = conn
-        .call(http_get())
+        .try_send_request(http_get())
         .await
         .expect_err("request must be canceled");
-    assert!(error.is_canceled(), "must be canceled: {error:?}");
-    conn.rescue_goaway()(error)
+    let request = error.message().expect("unwritten request must be returned");
+    assert_eq!(request.uri(), "http://server.test/");
+    error
 }
 
-/// A request canceled because the peer's graceful GOAWAY shut the
-/// connection down is refused. This drives the cancelation hyper produces
-/// for a request issued after the shutdown; the cancelation of a request
-/// already queued in the dispatcher is covered by
-/// `client::tests::h2_refuses_requests_abandoned_by_a_peer_goaway`.
+/// A request submitted after graceful GOAWAY is returned to the caller.
+/// Requests already queued are covered by the native client tests.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn refuses_canceled_requests_on_peer_goaway() {
+async fn returns_unwritten_requests_on_peer_goaway() {
     let (mut conn, server_io) = connect().await;
     shut_down(server_io, None).await;
 
-    let error = canceled_request(&mut conn).await;
-    let h2 = linkerd_error::cause_ref::<H2Error>(&*error).expect("must carry an HTTP/2 error");
-    assert_eq!(h2.reason(), Some(Reason::REFUSED_STREAM));
+    let error = canceled_request(&mut conn).await.into_error();
+    assert!(error.is_canceled(), "must be canceled: {error:?}");
 }
 
-/// A peer's GOAWAY carrying an error code ends the connection with an
-/// error rather than cleanly, so it exercises the other branch of the
-/// connection task's attribution.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn refuses_canceled_requests_on_peer_goaway_error() {
+async fn returns_unwritten_requests_on_peer_goaway_error() {
     let (mut conn, server_io) = connect().await;
     shut_down(server_io, Some(::h2::Reason::ENHANCE_YOUR_CALM)).await;
 
-    let error = canceled_request(&mut conn).await;
-    let h2 = linkerd_error::cause_ref::<H2Error>(&*error).expect("must carry an HTTP/2 error");
-    assert_eq!(h2.reason(), Some(Reason::REFUSED_STREAM));
+    let error = canceled_request(&mut conn).await.into_error();
+    assert!(error.is_canceled(), "must be canceled: {error:?}");
 }
 
-/// A request canceled because the connection failed without a peer GOAWAY
-/// preserves hyper's original error.
+/// Recovery proves the request was not written even without a peer GOAWAY.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn does_not_refuse_canceled_requests_without_goaway() {
+async fn returns_unwritten_requests_without_goaway() {
     let (mut conn, server_io) = connect().await;
-
-    // The server closes the connection without sending a GOAWAY.
     drop(server_io);
 
-    let error = canceled_request(&mut conn).await;
-    assert!(
-        linkerd_error::cause_ref::<H2Error>(&*error).is_none(),
-        "cancelation must not be attributed to a GOAWAY: {error:?}"
-    );
-    let hyper = linkerd_error::cause_ref::<hyper::Error>(&*error)
-        .expect("must be caused by hyper's client");
-    assert!(hyper.is_canceled(), "must be canceled: {hyper:?}");
+    let error = canceled_request(&mut conn).await.into_error();
+    assert!(error.is_canceled(), "must be canceled: {error:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn does_not_refuse_an_accepted_request_on_goaway() {
+async fn does_not_return_an_accepted_request_on_goaway() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let (mut conn, server_io) = connect().await;
         let server = tokio::spawn(async move {
@@ -113,27 +97,97 @@ async fn does_not_refuse_an_accepted_request_on_goaway() {
             srv.abrupt_shutdown(Reason::INTERNAL_ERROR);
             while let Some(Ok(_)) = srv.accept().await {}
         });
-        let rescue_goaway = conn.rescue_goaway();
         let error = conn
             .ready()
             .await
             .unwrap()
-            .call(http_get())
+            .try_send_request(http_get())
             .await
             .unwrap_err();
+        assert!(
+            error.message().is_none(),
+            "accepted request cannot be recovered"
+        );
+        let error = error.into_error();
         assert!(
             !error.is_canceled(),
             "accepted request must not be canceled: {error:?}"
         );
         server.await.unwrap();
-        while !conn.peer_goaway.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        let original = format!("{error:?}");
-        let error = rescue_goaway(error);
-        let hyper = linkerd_error::cause_ref::<hyper::Error>(&*error)
-            .expect("accepted request must preserve hyper's original error");
-        assert_eq!(format!("{hyper:?}"), original);
+    })
+    .await
+    .expect("request must finish");
+}
+
+/// GOAWAY can reject a stream already written on the wire. Its request is
+/// not recoverable through this API, even when its ID exceeds last-stream-id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_not_return_a_written_stream_above_goaway_last_stream_id() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (mut conn, mut server_io) = connect().await;
+        let server = tokio::spawn(async move {
+            let mut preface = [0; 24];
+            server_io.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            // Initial server SETTINGS, followed by the client's SETTINGS ACK.
+            server_io
+                .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            loop {
+                let mut header = [0; 9];
+                server_io.read_exact(&mut header).await.unwrap();
+                let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let mut payload = vec![0; len];
+                server_io.read_exact(&mut payload).await.unwrap();
+                match header[3] {
+                    4 if header[4] & 1 == 0 => {
+                        server_io
+                            .write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0])
+                            .await
+                            .unwrap();
+                    }
+                    1 => {
+                        let stream_id =
+                            u32::from_be_bytes(header[5..9].try_into().unwrap()) & 0x7fff_ffff;
+                        assert_eq!(stream_id, 1);
+                        // GOAWAY(NO_ERROR), last-stream-id=0: stream 1 was not processed.
+                        server_io
+                            .write_all(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let error = conn
+            .ready()
+            .await
+            .unwrap()
+            .try_send_request(http_get())
+            .await
+            .unwrap_err();
+        assert!(
+            error.message().is_none(),
+            "written request cannot be recovered"
+        );
+        let error = error.into_error();
+        assert!(
+            !error.is_canceled(),
+            "written stream has an HTTP/2 error: {error:?}"
+        );
+        let h2 = linkerd_error::cause_ref::<H2Error>(&error)
+            .unwrap_or_else(|| panic!("original HTTP/2 error: {error:?}"));
+        assert!(
+            h2.is_go_away() && h2.is_remote(),
+            "must retain peer GOAWAY: {h2:?}"
+        );
+        assert_eq!(h2.reason(), Some(Reason::NO_ERROR));
+        server.await.unwrap();
     })
     .await
     .expect("request must finish");

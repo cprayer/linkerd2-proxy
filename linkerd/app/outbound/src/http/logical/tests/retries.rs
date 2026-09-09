@@ -316,15 +316,15 @@ async fn http_h2_goaway_canceled() {
         svc,
         handle,
         http_get(),
-        mk_h2_goaway_canceled().await,
+        mk_h2_unwritten(true).await,
         mk_rsp(StatusCode::NO_CONTENT, ""),
     )
     .await;
     assert_eq!(rsp.expect("response").status(), StatusCode::NO_CONTENT);
 }
 
-/// A canceled request that the h2 client did not attribute to a peer's GOAWAY
-/// is not retried, even though a second response is available.
+/// A raw canceled error carries no proof that the request was not written.
+/// The retry layer must not retry it without the native client's refusal.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn http_h2_canceled_without_goaway() {
     let _trace = trace::test::trace_init();
@@ -344,6 +344,27 @@ async fn http_h2_canceled_without_goaway() {
     .expect_err("response should fail");
     let cause = errors::cause_ref::<hyper::Error>(&*error).expect("caused by hyper");
     assert!(cause.is_canceled(), "cause must be canceled: {cause:?}");
+}
+
+/// A native HTTP/2 client also refuses a request recovered after an I/O
+/// failure without GOAWAY. The same retry policy can retry this unwritten POST.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_unwritten_without_goaway() {
+    let _trace = trace::test::trace_init();
+    let (svc, handle) = mock_http(HttpParams {
+        retry: Some(mk_http_retry()),
+        ..Default::default()
+    });
+
+    let rsp = retry_canceled(
+        svc,
+        handle,
+        http_post(),
+        mk_h2_unwritten(false).await,
+        mk_rsp(StatusCode::NO_CONTENT, ""),
+    )
+    .await;
+    assert_eq!(rsp.expect("response").status(), StatusCode::NO_CONTENT);
 }
 
 /// A gRPC request abandoned by a graceful GOAWAY is retried, though no
@@ -368,7 +389,7 @@ async fn grpc_h2_goaway_canceled() {
         http::Request::post("/svc/method")
             .body(Default::default())
             .unwrap(),
-        mk_h2_goaway_canceled().await,
+        mk_h2_unwritten(true).await,
         mk_grpc_rsp(tonic::Code::Ok),
     )
     .await;
@@ -400,7 +421,7 @@ async fn http_h2_goaway_canceled_respects_policy() {
             svc,
             handle,
             req,
-            mk_h2_goaway_canceled().await,
+            mk_h2_unwritten(true).await,
             mk_rsp(StatusCode::NO_CONTENT, ""),
         )
         .await
@@ -600,10 +621,9 @@ async fn retry_canceled(
         .expect("response")
 }
 
-/// Builds the error hyper produces when a request is queued onto a connection
-/// that the server terminates with a graceful GOAWAY before the request can be
-/// written to it, as a grpc-go server does when it enforces `MaxConnectionAge`.
-async fn mk_h2_goaway_canceled() -> Error {
+/// Builds the native client's refusal when the peer closes a connection
+/// before the queued request can be written, with or without graceful GOAWAY.
+async fn mk_h2_unwritten(goaway: bool) -> Error {
     let (client_io, server_io) = io::duplex(64 * 1024);
     let client_io = Arc::new(Mutex::new(Some(client_io)));
     let connect = svc::service_fn(move |_: (http::Variant, ())| {
@@ -619,6 +639,9 @@ async fn mk_h2_goaway_canceled() -> Error {
         tokio::select! {
             accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
             _ = wait => {}
+        }
+        if !goaway {
+            return;
         }
         srv.graceful_shutdown();
         match srv.accept().await {
@@ -654,10 +677,8 @@ async fn mk_h2_goaway_canceled() -> Error {
 }
 
 /// Builds the error hyper produces when a request is queued onto a connection
-/// whose dispatcher goes away without a peer GOAWAY, e.g. because the
-/// connection failed with an I/O error. hyper cancels the request exactly as
-/// in the GOAWAY case, so nothing distinguishes the two at this layer; the
-/// h2 client's connection task only refuses the GOAWAY case.
+/// whose dispatcher is dropped. This bypasses the native client's request
+/// recovery so the retry layer receives the original, unclassified error.
 async fn mk_h2_canceled_no_goaway() -> Error {
     let (client_io, _server_io) = io::duplex(64 * 1024);
     let (mut tx, conn) = hyper::client::conn::http2::Builder::new(http::TokioExecutor::new())

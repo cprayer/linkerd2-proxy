@@ -157,14 +157,17 @@ where
             match self {
                 Self::Http1(ref mut svc) => svc.call(req),
                 Self::OrigProtoUpgrade(ref mut svc) => svc.call(req).map_err(Into::into).boxed(),
-                Self::H2(ref mut svc) => {
-                    let rescue_goaway = svc.rescue_goaway();
-                    Box::pin(
-                        svc.call(req)
-                            .map_err(rescue_goaway)
-                            .map_ok(|rsp| rsp.map(BoxBody::new)),
-                    ) as RspFuture
-                }
+                Self::H2(ref mut svc) => Box::pin(
+                    svc.try_send_request(req)
+                        .map_err(|error| -> Error {
+                            // Hyper returns the request only if it was not serialized.
+                            if error.message().is_some() {
+                                return h2::H2Error::from(h2::Reason::REFUSED_STREAM).into();
+                            }
+                            error.into_error().into()
+                        })
+                        .map_ok(|rsp| rsp.map(BoxBody::new)),
+                ) as RspFuture,
             }
         })
         .instrument(span.or_current())
@@ -177,14 +180,17 @@ mod tests {
     use linkerd_error::cause_ref;
     use std::sync::Arc;
 
-    /// A request that a peer's GOAWAY abandoned in hyper's dispatch queue
-    /// fails with REFUSED_STREAM so its caller can retry it.
-    ///
-    /// This drives the whole HTTP/2 client path against a real server's
-    /// graceful shutdown: the queued request, the connection task's
-    /// attribution of the shutdown, and this module's error mapping.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn h2_refuses_requests_abandoned_by_a_peer_goaway() {
+    fn connect() -> (
+        impl Future<
+            Output = impl Service<
+                http::Request<BoxBody>,
+                Response = http::Response<BoxBody>,
+                Error = Error,
+                Future = Instrumented<RspFuture>,
+            >,
+        >,
+        tokio::io::DuplexStream,
+    ) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let client_io = Arc::new(tokio::sync::Mutex::new(Some(client_io)));
         let connect = linkerd_stack::service_fn(move |_: (crate::Variant, ())| {
@@ -195,13 +201,35 @@ mod tests {
                 .expect("only one connection");
             futures::future::ok::<_, Error>((io, ()))
         });
+        let client = async move {
+            let client: Client<_, _, BoxBody> = MakeClient {
+                connect,
+                params: |_: &()| Params::H2(h2::ClientParams::default()),
+                _marker: PhantomData,
+            }
+            .oneshot(())
+            .await
+            .expect("client must connect");
+            client
+        };
+        (client, server_io)
+    }
 
-        // The server advertises no stream capacity, so hyper's dispatcher
-        // cannot write the request to the connection and it remains queued.
-        // Once signaled, the server performs the graceful shutdown that a
-        // grpc-go server does when it enforces `MaxConnectionAge`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn h2_refuses_requests_abandoned_by_a_peer_goaway() {
+        refuses_unwritten_request(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn h2_refuses_requests_abandoned_without_goaway() {
+        refuses_unwritten_request(false).await;
+    }
+
+    async fn refuses_unwritten_request(goaway: bool) {
+        let (client, server_io) = connect();
         let (shutdown, wait) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
+            // Zero stream capacity keeps the request in hyper's dispatch queue.
             let mut srv = ::h2::server::Builder::new()
                 .max_concurrent_streams(0)
                 .handshake::<_, bytes::Bytes>(server_io)
@@ -211,37 +239,93 @@ mod tests {
                 accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
                 _ = wait => {}
             }
-            srv.graceful_shutdown();
-            while let Some(Ok(_)) = srv.accept().await {}
+            if goaway {
+                srv.graceful_shutdown();
+                assert!(
+                    !matches!(srv.accept().await, Some(Ok(_))),
+                    "server must not accept a stream during shutdown"
+                );
+            }
         });
-
-        let mut client: Client<_, _, BoxBody> = MakeClient {
-            connect,
-            params: |_: &()| Params::H2(h2::ClientParams::default()),
-            _marker: PhantomData,
-        }
-        .oneshot(())
-        .await
-        .expect("client must connect");
-
+        let mut client = client.await;
         let rsp = client
             .ready()
             .await
             .expect("client must be ready")
-            .call(http_get());
-
+            .call(http_post());
         shutdown.send(()).expect("server must await the shutdown");
         server.await.expect("server task must not panic");
-
         let error = rsp.await.expect_err("request must fail");
-        let h2 = cause_ref::<h2::H2Error>(&*error).expect("must carry an HTTP/2 error");
+        let h2 = cause_ref::<h2::H2Error>(&*error)
+            .unwrap_or_else(|| panic!("must carry an HTTP/2 error: {error:?}"));
         assert_eq!(h2.reason(), Some(h2::Reason::REFUSED_STREAM));
     }
 
-    fn http_get() -> http::Request<BoxBody> {
-        http::Request::builder()
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_preserves_an_accepted_post_error() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (client, server_io) = connect();
+            let (observed, wait) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut srv = ::h2::server::handshake(server_io).await.unwrap();
+                let (request, mut respond) = srv.accept().await.unwrap().unwrap();
+                assert_eq!(request.method(), http::Method::POST);
+                respond.send_reset(h2::Reason::INTERNAL_ERROR);
+                tokio::select! {
+                    _ = wait => {}
+                    result = srv.accept() => panic!("accepted POST must not be sent again: {result:?}"),
+                }
+            });
+            let mut client = client.await;
+            let error = client
+                .ready()
+                .await
+                .unwrap()
+                .call(http_post())
+                .await
+                .unwrap_err();
+            let hyper = cause_ref::<hyper::Error>(&*error).expect("must preserve hyper's error");
+            assert!(!hyper.is_canceled());
+            let h2 = cause_ref::<h2::H2Error>(hyper)
+                .unwrap_or_else(|| panic!("original HTTP/2 error: {error:?}"));
+            assert_eq!(h2.reason(), Some(h2::Reason::INTERNAL_ERROR));
+            observed.send(()).unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .expect("request must finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_dropping_an_accepted_post_cancels_the_stream() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (client, server_io) = connect();
+            let (accepted, wait) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut srv = ::h2::server::handshake(server_io).await.unwrap();
+                let (request, mut respond) = srv.accept().await.unwrap().unwrap();
+                assert_eq!(request.method(), http::Method::POST);
+                accepted.send(()).unwrap();
+                tokio::select! {
+                    reset = futures::future::poll_fn(|cx| respond.poll_reset(cx)) => {
+                        assert_eq!(reset.unwrap(), h2::Reason::CANCEL);
+                    }
+                    result = srv.accept() => panic!("expected stream cancellation: {result:?}"),
+                }
+            });
+            let mut client = client.await;
+            let rsp = client.ready().await.unwrap().call(http_post());
+            wait.await.expect("server must accept the POST");
+            drop(rsp);
+            server.await.unwrap();
+        })
+        .await
+        .expect("stream must be canceled");
+    }
+
+    fn http_post() -> http::Request<BoxBody> {
+        http::Request::post("http://server.test/")
             .version(::http::Version::HTTP_2)
-            .uri("http://server.test/")
             .body(BoxBody::default())
             .expect("request must be valid")
     }
