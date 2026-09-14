@@ -158,8 +158,7 @@ where
                 Self::Http1(ref mut svc) => svc.call(req),
                 Self::OrigProtoUpgrade(ref mut svc) => svc.call(req).map_err(Into::into).boxed(),
                 Self::H2(ref mut svc) => Box::pin(
-                    svc.call(req)
-                        .err_into::<Error>()
+                    svc.send_request_or_refuse(req)
                         .map_ok(|rsp| rsp.map(BoxBody::new)),
                 ) as RspFuture,
             }

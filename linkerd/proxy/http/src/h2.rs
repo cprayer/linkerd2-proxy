@@ -5,6 +5,10 @@ use linkerd_stack::{MakeConnection, Service};
 use std::{
     marker::PhantomData,
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 use tracing::instrument::Instrument;
@@ -23,6 +27,13 @@ pub struct Connect<C, B> {
 #[derive(Debug)]
 pub struct Connection<B> {
     tx: hyper::client::conn::http2::SendRequest<B>,
+    state: Arc<ConnectionState>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionState {
+    locally_dropped: AtomicBool,
+    graceful_peer_goaway: AtomicBool,
 }
 
 // === impl Connect ===
@@ -77,6 +88,8 @@ where
             max_send_buf_size,
             max_header_list_size,
         } = self.params;
+        // Hyper also reports client keep-alive timeouts as clean connection shutdowns.
+        let track_graceful_goaway = keep_alive.is_none();
 
         let connect = self
             .connect
@@ -127,17 +140,32 @@ where
                     builder.max_header_list_size(sz);
                 }
 
-                let (tx, conn) = builder
+                let (tx, mut conn) = builder
                     .handshake(hyper_util::rt::TokioIo::new(io))
                     .instrument(trace_span!("handshake").or_current())
                     .await?;
 
+                let state = Arc::new(ConnectionState::default());
                 tokio::spawn(
-                    conn.map_err(|error| debug!(%error, "failed"))
-                        .instrument(trace_span!("conn").or_current()),
+                    {
+                        let state = state.clone();
+                        async move {
+                            match (&mut conn).await {
+                                Ok(())
+                                    if track_graceful_goaway
+                                        && !state.locally_dropped.load(Ordering::Acquire) =>
+                                {
+                                    state.graceful_peer_goaway.store(true, Ordering::Release);
+                                }
+                                Ok(()) => {}
+                                Err(error) => debug!(%error, "failed"),
+                            }
+                        }
+                    }
+                    .instrument(trace_span!("conn").or_current()),
                 );
 
-                Ok(Connection { tx })
+                Ok(Connection { tx, state })
             }
             .instrument(debug_span!("h2").or_current()),
         )
@@ -145,6 +173,35 @@ where
 }
 
 // === impl Connection ===
+
+impl<B> Connection<B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Error> + Send + Sync,
+{
+    pub(crate) fn send_request_or_refuse(
+        &mut self,
+        req: http::Request<B>,
+    ) -> impl Future<Output = Result<http::Response<hyper::body::Incoming>>> + Send {
+        let state = self.state.clone();
+        self.tx
+            .try_send_request(prepare_request(req))
+            .map_err(move |error| {
+                // A recovered request was never accepted by this upstream connection.
+                if error.message().is_some() && state.graceful_peer_goaway.load(Ordering::Acquire) {
+                    return H2Error::from(Reason::REFUSED_STREAM).into();
+                }
+                error.into_error().into()
+            })
+    }
+}
+
+impl<B> Drop for Connection<B> {
+    fn drop(&mut self) {
+        self.state.locally_dropped.store(true, Ordering::Release);
+    }
+}
 
 impl<B> tower::Service<http::Request<B>> for Connection<B>
 where
@@ -161,21 +218,28 @@ where
         self.tx.poll_ready(cx).map_err(From::from)
     }
 
-    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
-        debug_assert_eq!(
-            req.version(),
-            http::Version::HTTP_2,
-            "request version should be HTTP/2",
-        );
-
-        // A request translated from HTTP/1 to 2 might not include an
-        // authority. In order to support that case, our h2 library requires
-        // the version to be dropped down from HTTP/2, as a form of us
-        // explicitly acknowledging that its not a normal HTTP/2 form.
-        if req.uri().authority().is_none() {
-            *req.version_mut() = http::Version::HTTP_11;
-        }
-
-        self.tx.send_request(req).boxed()
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        self.tx.send_request(prepare_request(req)).boxed()
     }
 }
+
+fn prepare_request<B>(mut req: http::Request<B>) -> http::Request<B> {
+    debug_assert_eq!(
+        req.version(),
+        http::Version::HTTP_2,
+        "request version should be HTTP/2",
+    );
+
+    // A request translated from HTTP/1 to 2 might not include an
+    // authority. In order to support that case, our h2 library requires
+    // the version to be dropped down from HTTP/2, as a form of us
+    // explicitly acknowledging that its not a normal HTTP/2 form.
+    if req.uri().authority().is_none() {
+        *req.version_mut() = http::Version::HTTP_11;
+    }
+
+    req
+}
+
+#[cfg(test)]
+mod tests;
