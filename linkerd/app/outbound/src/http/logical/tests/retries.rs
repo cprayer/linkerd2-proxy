@@ -1,9 +1,9 @@
 use super::*;
 use http_body_util::BodyExt;
 use linkerd_app_core::{
-    errors,
+    errors, io,
     proxy::http::{self, StatusCode},
-    svc::http::stream_timeouts::StreamDeadlineError,
+    svc::{http::stream_timeouts::StreamDeadlineError, Service},
     trace,
 };
 use linkerd_proxy_client_policy::{
@@ -302,6 +302,118 @@ async fn http_timeout_with_request_timeout() {
     assert!(errors::is_caused_by::<StreamDeadlineError>(&*error));
 }
 
+/// Reproduces linkerd/linkerd2#12964: a request abandoned by a graceful
+/// GOAWAY was never written to the connection, so it is retried.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn grpc_h2_goaway_canceled() {
+    let _trace = trace::test::trace_init();
+    let (svc, handle) = mock_grpc(GrpcParams {
+        retry: Some(client_policy::grpc::Retry {
+            max_retries: 1,
+            codes: Codes(Default::default()),
+            max_request_bytes: 1000,
+            timeout: None,
+            backoff: None,
+        }),
+        ..Default::default()
+    });
+
+    let rsp = retry_canceled(
+        svc,
+        handle,
+        http::Request::post("/svc/method")
+            .body(Default::default())
+            .unwrap(),
+        mk_h2_unwritten().await,
+        mk_grpc_rsp(tonic::Code::Ok),
+    )
+    .await;
+    let rsp = rsp.expect("response");
+    assert_eq!(rsp.status(), StatusCode::OK);
+    let body = rsp.into_body().collect().await.expect("response body");
+    assert_eq!(body.trailers().expect("gRPC trailers")["grpc-status"], "0");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_goaway_canceled_respects_policy() {
+    for (retry, body) in [
+        (None, "".to_owned()),
+        (
+            Some(client_policy::http::Retry {
+                max_retries: 0,
+                ..mk_http_retry()
+            }),
+            "".to_owned(),
+        ),
+        (Some(mk_http_retry()), "x".repeat(1001)),
+    ] {
+        let (svc, handle) = mock_http(HttpParams {
+            retry,
+            ..Default::default()
+        });
+        let req = http::Request::post("/").body(BoxBody::new(body)).unwrap();
+        let error = retry_canceled(
+            svc,
+            handle,
+            req,
+            mk_h2_unwritten().await,
+            mk_rsp(StatusCode::NO_CONTENT, ""),
+        )
+        .await
+        .expect_err("policy must prevent retry");
+        let h2 = errors::cause_ref::<http::h2::H2Error>(&*error).expect("HTTP/2 error");
+        assert_eq!(h2.reason(), Some(http::h2::Reason::REFUSED_STREAM));
+    }
+}
+
+/// The native client recovers a request before anything reads its body, so the
+/// retry starts from a body that was never polled. The upstream must observe
+/// the payload exactly once.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn http_h2_unwritten_retry_sends_the_body_once() {
+    const BODY: &str = "hello world";
+
+    let _trace = trace::test::trace_init();
+    let (svc, mut handle) = mock_http(HttpParams {
+        retry: Some(mk_http_retry()),
+        ..Default::default()
+    });
+    let error = mk_h2_unwritten().await;
+    let (tx_observed, rx_observed) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(
+        async move {
+            handle.allow(2);
+            info!("Abandoning the first request without reading its body");
+            let (req, tx) = handle.next_request().await.expect("first request");
+            drop(req);
+            tx.send_error(error);
+
+            info!("Serving the retried request");
+            let (req, tx) = handle.next_request().await.expect("retried request");
+            let body = req
+                .into_body()
+                .collect()
+                .await
+                .expect("retried request body")
+                .to_bytes();
+            tx.send_response(mk_rsp(StatusCode::NO_CONTENT, "").await.unwrap());
+            let _ = tx_observed.send(body);
+        }
+        .in_current_span(),
+    );
+
+    let req = http::Request::post("/")
+        .body(BoxBody::new(BODY.to_owned()))
+        .unwrap();
+    let rsp = time::timeout(time::Duration::from_secs(2), send_req(svc, req))
+        .await
+        .expect("response")
+        .expect("response");
+    assert_eq!(rsp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(rx_observed.await.expect("retried request body"), BODY);
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn grpc_internal() {
     let _trace = trace::test::with_default_filter("linkerd=debug");
@@ -449,4 +561,96 @@ async fn grpc_timeout() {
             .unwrap(),
         "0"
     );
+}
+
+// === Utils ===
+
+fn mk_http_retry() -> client_policy::http::Retry {
+    client_policy::http::Retry {
+        max_retries: 1,
+        status_ranges: Default::default(),
+        max_request_bytes: 1000,
+        timeout: None,
+        backoff: None,
+    }
+}
+
+/// Fails the first request with `error` and makes `retried` available to a
+/// second, so that the response observed by the caller distinguishes a request
+/// that was retried from one that was not.
+async fn retry_canceled(
+    svc: svc::BoxCloneHttp,
+    mut handle: Handle,
+    req: ::http::Request<BoxBody>,
+    error: Error,
+    retried: impl Future<Output = Result<Response>> + Send + 'static,
+) -> Result<Response> {
+    const TIMEOUT: time::Duration = time::Duration::from_secs(2);
+
+    tokio::spawn(
+        async move {
+            handle.allow(2);
+            info!("Failing the first request with a canceled dispatch");
+            serve(&mut handle, async move { Err(error) }).await;
+            info!("Serving the second request");
+            serve(&mut handle, retried).await;
+            handle
+        }
+        .in_current_span(),
+    );
+
+    time::timeout(TIMEOUT, send_req(svc, req))
+        .await
+        .expect("response")
+}
+
+/// Builds the native client's refusal for a request the peer abandoned in
+/// hyper's dispatch queue, before it could be written.
+async fn mk_h2_unwritten() -> Error {
+    let (client_io, server_io) = io::duplex(64 * 1024);
+    let client_io = Arc::new(Mutex::new(Some(client_io)));
+    let connect = svc::service_fn(move |_: (http::Variant, ())| {
+        futures::future::ok::<_, Error>((client_io.lock().take().expect("only one connection"), ()))
+    });
+    let (shutdown, wait) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut srv = h2::server::Builder::new()
+            .max_concurrent_streams(0)
+            .handshake::<_, bytes::Bytes>(server_io)
+            .await
+            .expect("server handshake must succeed");
+        tokio::select! {
+            accepted = srv.accept() => panic!("server must not accept a stream: {accepted:?}"),
+            _ = wait => {}
+        }
+        srv.graceful_shutdown();
+        match srv.accept().await {
+            Some(Ok(_)) => panic!("server must not accept a stream during shutdown"),
+            Some(Err(error)) => assert!(error
+                .get_io()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)),
+            None => {}
+        }
+    });
+    let mut client = svc::stack(connect)
+        .push(http::client::layer_via(|_: &()| {
+            http::client::Params::H2(http::h2::ClientParams::default())
+        }))
+        .into_inner()
+        .oneshot(())
+        .await
+        .expect("client must connect");
+    let mut req = http::Request::post("http://server.test/")
+        .body(BoxBody::default())
+        .unwrap();
+    *req.version_mut() = ::http::Version::HTTP_2;
+    let rsp = client
+        .ready()
+        .await
+        .expect("client must be ready")
+        .call(req);
+    shutdown.send(()).expect("server must await shutdown");
+    server.await.expect("server task must not panic");
+
+    rsp.await.expect_err("request must be canceled")
 }

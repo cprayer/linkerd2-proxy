@@ -146,6 +146,39 @@ where
 
 // === impl Connection ===
 
+impl<B> Connection<B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Error> + Send + Sync,
+{
+    pub(crate) fn try_send_request(
+        &mut self,
+        mut req: http::Request<B>,
+    ) -> impl Future<
+        Output = Result<
+            http::Response<hyper::body::Incoming>,
+            hyper::client::conn::TrySendError<http::Request<B>>,
+        >,
+    > + Send {
+        debug_assert_eq!(
+            req.version(),
+            http::Version::HTTP_2,
+            "request version should be HTTP/2",
+        );
+
+        // A request translated from HTTP/1 to 2 might not include an
+        // authority. In order to support that case, our h2 library requires
+        // the version to be dropped down from HTTP/2, as a form of us
+        // explicitly acknowledging that its not a normal HTTP/2 form.
+        if req.uri().authority().is_none() {
+            *req.version_mut() = http::Version::HTTP_11;
+        }
+
+        self.tx.try_send_request(req)
+    }
+}
+
 impl<B> tower::Service<http::Request<B>> for Connection<B>
 where
     B: Body + Send + 'static,
@@ -161,21 +194,9 @@ where
         self.tx.poll_ready(cx).map_err(From::from)
     }
 
-    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
-        debug_assert_eq!(
-            req.version(),
-            http::Version::HTTP_2,
-            "request version should be HTTP/2",
-        );
-
-        // A request translated from HTTP/1 to 2 might not include an
-        // authority. In order to support that case, our h2 library requires
-        // the version to be dropped down from HTTP/2, as a form of us
-        // explicitly acknowledging that its not a normal HTTP/2 form.
-        if req.uri().authority().is_none() {
-            *req.version_mut() = http::Version::HTTP_11;
-        }
-
-        self.tx.send_request(req).boxed()
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        self.try_send_request(req)
+            .map_err(hyper::client::conn::TrySendError::into_error)
+            .boxed()
     }
 }

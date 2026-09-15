@@ -332,6 +332,9 @@ impl Error {
             if h2e.is_go_away() {
                 return Ok(Self::GoAway);
             }
+            if h2e.reason() == Some(Reason::REFUSED_STREAM) {
+                return Ok(Self::Refused);
+            }
             if h2e.is_io() {
                 return Ok(Self::Io);
             }
@@ -361,4 +364,12 @@ impl EncodeLabelValue for Error {
             Self::Unknown => enc.write_str("UNKNOWN"),
         }
     }
+}
+
+#[test]
+fn locally_refused_request_is_labeled() {
+    let refused = http::h2::H2Error::from(http::h2::Reason::REFUSED_STREAM);
+    assert!(!refused.is_reset());
+    let error: BoxError = refused.into();
+    assert!(matches!(Error::new_or_status(&error), Ok(Error::Refused)));
 }

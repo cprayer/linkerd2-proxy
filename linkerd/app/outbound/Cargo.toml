@@ -54,6 +54,7 @@ linkerd-tonic-watch = { path = "../../tonic-watch" }
 
 [dev-dependencies]
 futures-util = "0.3"
+h2 = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true, features = ["channel"] }
 hyper = { workspace = true, features = ["http1", "http2"] }
